@@ -1,0 +1,607 @@
+# =============================================================================
+#  SuperFan v2 — ventoínha 3 velocidades, modos Off / Auto HR / Temp. alvo /
+#  Manual / Remoto. Port de smartbtlefan/main_1v0.ino para ESPHome (API nativa).
+# =============================================================================
+#  Hardware (ESP32 WROOM-32, esp32dev):
+#    Relés (ativos a HIGH, exclusivos): GPIO19 = vel.1, GPIO23 = vel.2, GPIO33 = vel.3
+#    NeoPixel (1 LED, GRB):             GPIO27
+#    Botão:                             GPIO21  (GPIO25 a LOW = massa do botão)
+#
+#  Modos (select "Modo"; arranca SEMPRE em Off):
+#    Off        relés desligados, BLE continua ligado
+#    Auto HR    zonas de bpm deslocadas pela temperatura (ginásio + pele do CORE)
+#    Temp. alvo mantém a temp. central do CORE; sem CORE > timeout -> Manual
+#    Manual     velocidade escolhida à mão; fica até mudares de modo
+#    Remoto     a app manda na velocidade (fan.set_percentage 0/33/66/100)
+#
+#  Regra de override (sem tempo): mexer na ventoínha (HA) em Off/Auto/Alvo passa
+#  para Manual (ou Off, se a desligares). Em Remoto os sets são o comando da app.
+#
+#  Botão:  curto  Off -> Auto HR -> Temp. alvo -> Manual 1 -> 2 -> 3 -> Off
+#                 (em Remoto: curto = Manual à velocidade atual)
+#          longo (>= 1,5 s)  Off imediato
+#  LED:    flash 1,5 s com a cor do modo ao mudar  (Off branco, Auto HR ciano,
+#          Temp. alvo magenta, Manual amarelo, Remoto azul); depois velocidade
+#          1 verde / 2 laranja / 3 vermelho, velocidade 0 = cor do modo fraca,
+#          a piscar na cor do modo = sem dados da fonte.
+# =============================================================================
+
+substitutions:
+  name: superfan
+  friendly_name: SuperFan
+  mac_fita_1: "AA:BB:CC:DD:EE:01"            # <-- MAC da fita HR principal
+  mac_fita_2: "AA:BB:CC:DD:EE:02"            # <-- MAC da 2.ª fita (ou apaga o bloco)
+  mac_core:   "AA:BB:CC:DD:EE:03"            # <-- MAC do CORE
+  ha_temp_ginasio: sensor.ginasio_temperatura   # <-- entidade HA da temperatura do ginásio
+  core_timeout_min: "5"                      # Temp. alvo: minutos sem CORE até passar a Manual
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - light.turn_on:
+          id: led_estado
+          brightness: 30%
+          effect: "Estado"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret superfan_api_key
+
+ota:
+  - platform: esphome
+    password: !secret superfan_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "SuperFan Fallback"
+
+captive_portal:
+
+# -----------------------------------------------------------------------------
+#  Estado interno
+# -----------------------------------------------------------------------------
+globals:
+  - { id: target_level,  type: int,      initial_value: '0' }     # nível pedido aos relés
+  - { id: internal_write, type: bool,    initial_value: 'false' } # set feito pelo firmware
+  - { id: ext_fan_event, type: bool,     initial_value: 'false' } # set externo pendente
+  - { id: last_mode,     type: int,      initial_value: '-1' }
+  - { id: manual_keep,   type: bool,     initial_value: 'false' } # entrar em Manual sem mexer na vel.
+  - { id: flash_until,   type: uint32_t, initial_value: '0' }
+  - { id: data_ok,       type: bool,     initial_value: 'true' }
+  - { id: hr1_ts,        type: uint32_t, initial_value: '0' }
+  - { id: hr2_ts,        type: uint32_t, initial_value: '0' }
+  - { id: hrc_ts,        type: uint32_t, initial_value: '0' }
+  - { id: ct_ts,         type: uint32_t, initial_value: '0' }
+  - { id: hr_zone_g,     type: int,      initial_value: '0' }
+  - { id: ct_zone_g,     type: int,      initial_value: '0' }
+  - { id: ct_change_ms,  type: uint32_t, initial_value: '0' }
+  - { id: core_lost_ms,  type: uint32_t, initial_value: '0' }
+  - { id: slope_ref,     type: float,    initial_value: '0' }
+  - { id: slope_ref_ms,  type: uint32_t, initial_value: '0' }
+  - { id: ct_slope,      type: float,    initial_value: '0' }     # °C/min, suavizado
+
+# -----------------------------------------------------------------------------
+#  Relés
+# -----------------------------------------------------------------------------
+output:
+  - { platform: gpio, id: rele1, pin: GPIO19 }
+  - { platform: gpio, id: rele2, pin: GPIO23 }
+  - { platform: gpio, id: rele3, pin: GPIO33 }
+  - { platform: gpio, id: botao_gnd, pin: GPIO25 }   # massa do botão (fica a LOW)
+
+  - platform: template          # 1/3, 2/3, 1 -> relé 1, 2, 3
+    id: fan_out
+    type: float
+    write_action:
+      - lambda: 'id(target_level) = (int) roundf(state * 3.0f);'
+      - script.execute: aplicar_reles
+
+script:
+  # Break-before-make: nunca dois enrolamentos do motor alimentados ao mesmo tempo.
+  - id: aplicar_reles
+    mode: restart
+    then:
+      - lambda: |-
+          id(rele1).turn_off(); id(rele2).turn_off(); id(rele3).turn_off();
+      - if:
+          condition:
+            lambda: 'return id(target_level) > 0;'
+          then:
+            - delay: 150ms
+            - lambda: |-
+                switch (id(target_level)) {
+                  case 1: id(rele1).turn_on(); break;
+                  case 2: id(rele2).turn_on(); break;
+                  case 3: id(rele3).turn_on(); break;
+                }
+
+  # Set de velocidade feito pelo firmware (não conta como override)
+  - id: set_vel
+    parameters:
+      s: int
+    then:
+      - lambda: |-
+          const int cur = id(ventoinha).state ? id(ventoinha).speed : 0;
+          if (s == cur) return;
+          id(internal_write) = true;
+          if (s <= 0) {
+            id(ventoinha).turn_off().perform();
+          } else {
+            auto c = id(ventoinha).turn_on(); c.set_speed(s > 3 ? 3 : s); c.perform();
+          }
+          id(internal_write) = false;
+
+  - id: set_modo
+    parameters:
+      m: int
+    then:
+      - lambda: 'id(modo).make_call().set_index(m).perform();'
+
+fan:
+  - platform: speed
+    id: ventoinha
+    name: "Ventoínha"
+    output: fan_out
+    speed_count: 3
+    restore_mode: ALWAYS_OFF
+    on_state:
+      - lambda: 'if (!id(internal_write)) id(ext_fan_event) = true;'
+
+# -----------------------------------------------------------------------------
+#  LED: todo o desenho é feito no efeito "Estado" (lê o estado a 20 Hz)
+# -----------------------------------------------------------------------------
+light:
+  - platform: esp32_rmt_led_strip
+    id: led_estado
+    name: "LED"
+    pin: GPIO27
+    num_leds: 1
+    chipset: WS2812
+    rgb_order: GRB
+    default_transition_length: 0s
+    restore_mode: ALWAYS_ON
+    effects:
+      - addressable_lambda:
+          name: "Estado"
+          update_interval: 50ms
+          lambda: |-
+            const uint32_t now = millis();
+            auto i = id(modo).active_index();
+            const int m = i.has_value() ? (int) *i : 0;
+            static const Color MC[5] = {
+              Color(255, 255, 255),   // Off
+              Color(0, 255, 255),     // Auto HR
+              Color(255, 0, 255),     // Temp. alvo
+              Color(255, 200, 0),     // Manual
+              Color(0, 0, 255)};      // Remoto
+            auto dim = [](Color c, int d) { return Color(c.r / d, c.g / d, c.b / d); };
+            if ((int32_t) (id(flash_until) - now) > 0) { it[0] = MC[m]; return; }
+            if (m == 0) { it[0] = Color(0, 0, 0); return; }
+            if (!id(data_ok)) { it[0] = ((now / 400) % 2) ? dim(MC[m], 2) : Color(0, 0, 0); return; }
+            const int s = id(ventoinha).state ? id(ventoinha).speed : 0;
+            switch (s) {
+              case 1:  it[0] = Color(0, 120, 0);  break;   // verde
+              case 2:  it[0] = Color(120, 55, 0); break;   // laranja
+              case 3:  it[0] = Color(120, 0, 0);  break;   // vermelho
+              default: it[0] = dim(MC[m], 8);     break;   // à espera
+            }
+
+# -----------------------------------------------------------------------------
+#  BLE
+# -----------------------------------------------------------------------------
+esp32_ble_tracker:            # max_connections por omissão = 3 (2 fitas + CORE)
+
+ble_client:
+  - { id: fita_1, mac_address: "${mac_fita_1}" }
+  - { id: fita_2, mac_address: "${mac_fita_2}" }
+  - { id: core_sensor, mac_address: "${mac_core}" }
+
+# -----------------------------------------------------------------------------
+#  Controlos
+# -----------------------------------------------------------------------------
+select:
+  - platform: template
+    id: modo
+    name: "Modo"
+    icon: mdi:fan-auto
+    optimistic: true
+    restore_value: false          # arranca sempre em Off
+    initial_option: "Off"
+    options:
+      - "Off"
+      - "Auto HR"
+      - "Temp. alvo"
+      - "Manual"
+      - "Remoto"
+
+number:
+  # ---------- Auto HR: zonas base (valem à temperatura "neutra", a meio de frio/quente)
+  - { platform: template, id: hr_z1, name: "HR zona 1", icon: "mdi:heart-pulse", optimistic: true, restore_value: true, initial_value: 117, min_value: 60, max_value: 220, step: 1, unit_of_measurement: bpm, mode: box }
+  - { platform: template, id: hr_z2, name: "HR zona 2", icon: "mdi:heart-pulse", optimistic: true, restore_value: true, initial_value: 146, min_value: 60, max_value: 220, step: 1, unit_of_measurement: bpm, mode: box }
+  - { platform: template, id: hr_z3, name: "HR zona 3", icon: "mdi:heart-pulse", optimistic: true, restore_value: true, initial_value: 169, min_value: 60, max_value: 220, step: 1, unit_of_measurement: bpm, mode: box }
+  - { platform: template, id: hr_hyst, name: "HR histerese", icon: "mdi:arrow-collapse-down", optimistic: true, restore_value: true, initial_value: 3, min_value: 0, max_value: 15, step: 1, unit_of_measurement: bpm, mode: box, entity_category: config }
+
+  # ---------- Auto HR: desvio por temperatura
+  #  frio -> zonas + desvio ; quente -> zonas - desvio ; linear no meio
+  - { platform: template, id: desvio_max, name: "Desvio HR máx.", icon: "mdi:swap-vertical", optimistic: true, restore_value: true, initial_value: 20, min_value: 0, max_value: 50, step: 1, unit_of_measurement: bpm, mode: box }
+  - { platform: template, id: amb_frio, name: "Ginásio frio", icon: "mdi:snowflake", optimistic: true, restore_value: true, initial_value: 15, min_value: 0, max_value: 40, step: 0.5, unit_of_measurement: "°C", mode: box }
+  - { platform: template, id: amb_quente, name: "Ginásio quente", icon: "mdi:fire", optimistic: true, restore_value: true, initial_value: 30, min_value: 0, max_value: 45, step: 0.5, unit_of_measurement: "°C", mode: box }
+  - { platform: template, id: pele_fria, name: "Pele fria", icon: "mdi:snowflake", optimistic: true, restore_value: true, initial_value: 32, min_value: 25, max_value: 40, step: 0.1, unit_of_measurement: "°C", mode: box, entity_category: config }
+  - { platform: template, id: pele_quente, name: "Pele quente", icon: "mdi:fire", optimistic: true, restore_value: true, initial_value: 35.5, min_value: 25, max_value: 40, step: 0.1, unit_of_measurement: "°C", mode: box, entity_category: config }
+  - { platform: template, id: peso_pele, name: "Peso da pele no desvio", icon: "mdi:scale-balance", optimistic: true, restore_value: true, initial_value: 50, min_value: 0, max_value: 100, step: 5, unit_of_measurement: "%", mode: slider, entity_category: config }
+
+  # ---------- Temp. alvo
+  - { platform: template, id: t_alvo, name: "Temp. central alvo", icon: "mdi:thermometer-check", optimistic: true, restore_value: true, initial_value: 38.3, min_value: 37.0, max_value: 40.0, step: 0.05, unit_of_measurement: "°C", mode: box }
+  - { platform: template, id: banda, name: "Temp. alvo banda por velocidade", icon: "mdi:stairs-up", optimistic: true, restore_value: true, initial_value: 0.3, min_value: 0.05, max_value: 1.0, step: 0.05, unit_of_measurement: "°C", mode: box, entity_category: config }
+  - { platform: template, id: ct_hyst, name: "Temp. alvo histerese", icon: "mdi:arrow-collapse-down", optimistic: true, restore_value: true, initial_value: 0.1, min_value: 0, max_value: 0.5, step: 0.05, unit_of_measurement: "°C", mode: box, entity_category: config }
+  - { platform: template, id: dwell_s, name: "Temp. alvo tempo mín. antes de baixar", icon: "mdi:timer-outline", optimistic: true, restore_value: true, initial_value: 60, min_value: 0, max_value: 600, step: 10, unit_of_measurement: s, mode: box, entity_category: config }
+  - { platform: template, id: antecipacao, name: "Temp. alvo antecipação", icon: "mdi:chart-line-variant", optimistic: true, restore_value: true, initial_value: 0, min_value: 0, max_value: 10, step: 0.5, unit_of_measurement: min, mode: box, entity_category: config }
+
+sensor:
+  # ---------- Fita 1 ----------
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: fita_1
+    id: hr_fita1
+    name: "HR fita 1"
+    service_uuid: "180D"
+    characteristic_uuid: "2A37"
+    notify: true
+    update_interval: never
+    unit_of_measurement: bpm
+    icon: mdi:heart-pulse
+    accuracy_decimals: 0
+    lambda: |-
+      // 0x2A37: flags bit0 = formato UINT16; senão UINT8 em x[1]
+      if (x.size() < 2) return NAN;
+      uint16_t bpm = x[1];
+      if ((x[0] & 0x01) && x.size() >= 3) bpm = x[1] | (x[2] << 8);
+      if (bpm == 0) return NAN;
+      id(hr1_ts) = millis();
+      return (float) bpm;
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: fita_1
+    name: "Bateria fita 1"
+    service_uuid: "180F"
+    characteristic_uuid: "2A19"
+    unit_of_measurement: "%"
+    device_class: battery
+    entity_category: diagnostic
+    update_interval: 15min
+
+  # ---------- Fita 2 ----------
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: fita_2
+    id: hr_fita2
+    name: "HR fita 2"
+    service_uuid: "180D"
+    characteristic_uuid: "2A37"
+    notify: true
+    update_interval: never
+    unit_of_measurement: bpm
+    icon: mdi:heart-pulse
+    accuracy_decimals: 0
+    lambda: |-
+      if (x.size() < 2) return NAN;
+      uint16_t bpm = x[1];
+      if ((x[0] & 0x01) && x.size() >= 3) bpm = x[1] | (x[2] << 8);
+      if (bpm == 0) return NAN;
+      id(hr2_ts) = millis();
+      return (float) bpm;
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: fita_2
+    name: "Bateria fita 2"
+    service_uuid: "180F"
+    characteristic_uuid: "2A19"
+    unit_of_measurement: "%"
+    device_class: battery
+    entity_category: diagnostic
+    update_interval: 15min
+
+  # ---------- CORE (spec CoreTemp BLE v2.2) ----------
+  # Payload LSB-first: Flags | Core SINT16 | Skin SINT16 | Reserved SINT16 |
+  #                    Quality&State u8 | HR u8 | HSI u8 (0.1)
+  # Flags: b0 skin, b1 reserved, b2 quality, b3 °F, b4 HR, b5 HSI.
+  # A spec diz "valid/invalid" mas as notas dizem "nem todos presentes": com 10 bytes
+  # usa offsets fixos; com menos, avança só pelos campos com flag a 1.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: core_sensor
+    id: core_temp
+    name: "CORE temperatura central"
+    service_uuid: "00002100-5b1e-4347-b07c-97b514dae121"
+    characteristic_uuid: "00002101-5b1e-4347-b07c-97b514dae121"
+    notify: true
+    update_interval: never
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 2
+    lambda: |-
+      if (x.size() < 3) return NAN;
+      const uint8_t f = x[0];
+      const bool fahr = f & 0x08;
+      const bool fixed = x.size() >= 10;
+      auto s16 = [&](size_t i) -> int16_t { return (int16_t) (x[i] | (x[i + 1] << 8)); };
+      auto conv = [&](int16_t raw) -> float {
+        float v = raw / 100.0f;
+        return fahr ? (v - 32.0f) * 5.0f / 9.0f : v;
+      };
+      size_t i = 3;
+      float skin = NAN, hsi = NAN;
+      int q = -1, hr = 0;
+      if (fixed || (f & 0x01)) { if ((f & 0x01) && i + 1 < x.size() && s16(i) != 0x7FFF) skin = conv(s16(i)); i += 2; }
+      if (fixed || (f & 0x02)) { i += 2; }
+      if (fixed || (f & 0x04)) { if ((f & 0x04) && i < x.size()) q = x[i]; i += 1; }
+      if (fixed || (f & 0x10)) { if ((f & 0x10) && i < x.size()) hr = x[i]; i += 1; }
+      if (fixed || (f & 0x20)) { if ((f & 0x20) && i < x.size()) hsi = x[i] / 10.0f; i += 1; }
+
+      id(core_skin).publish_state(skin);
+      id(core_hsi).publish_state(hsi);
+      if (hr > 0) { id(hrc_ts) = millis(); id(hr_core).publish_state(hr); }
+
+      if (q >= 0) {
+        static const char *QUAL[] = {"Inválida", "Fraca", "Razoável", "Boa", "Excelente", "?", "?", "N/D"};
+        static const char *HRST[] = {"Sem suporte HR", "Sem sinal HR", "A receber HR", "N/D"};
+        std::string qs = QUAL[q & 0x07];
+        std::string hs = HRST[(q >> 4) & 0x03];
+        if (id(core_qualidade).state != qs) id(core_qualidade).publish_state(qs);
+        if (id(core_estado_hr).state != hs) id(core_estado_hr).publish_state(hs);
+      }
+
+      const int16_t raw = s16(1);
+      if (raw == 0x7FFF) return NAN;        // "Data not available"
+      id(ct_ts) = millis();
+      return conv(raw);
+
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: core_sensor
+    name: "CORE bateria"
+    service_uuid: "180F"
+    characteristic_uuid: "2A19"
+    unit_of_measurement: "%"
+    device_class: battery
+    entity_category: diagnostic
+    update_interval: 15min
+
+  - platform: template
+    id: core_skin
+    name: "CORE temperatura pele"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+  - platform: template
+    id: core_hsi
+    name: "CORE heat strain index"
+    icon: mdi:weather-sunny-alert
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: never
+  - platform: template
+    id: hr_core
+    name: "HR via CORE"
+    unit_of_measurement: bpm
+    icon: mdi:heart-pulse
+    accuracy_decimals: 0
+    update_interval: never
+
+
+  # ---------- Temperatura do ginásio (vinda do HA)
+  - platform: homeassistant
+    id: temp_ginasio
+    entity_id: ${ha_temp_ginasio}
+    internal: true
+
+  # ---------- HR ativo: fita 1 > fita 2 > HR via CORE, com dados há < 10 s
+  - platform: template
+    id: hr_ativo
+    name: "HR"
+    unit_of_measurement: bpm
+    icon: mdi:heart-pulse
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      const uint32_t now = millis(), TO = 10000;
+      if (id(hr1_ts) && now - id(hr1_ts) < TO) return id(hr_fita1).state;
+      if (id(hr2_ts) && now - id(hr2_ts) < TO) return id(hr_fita2).state;
+      if (id(hrc_ts) && now - id(hrc_ts) < TO) return id(hr_core).state;
+      return NAN;
+
+  # ---------- Diagnóstico da lógica
+  - { platform: template, id: s_desvio, name: "Desvio HR atual", unit_of_measurement: bpm, icon: "mdi:swap-vertical", accuracy_decimals: 0, update_interval: never }
+  - { platform: template, id: s_z1_ef, name: "HR zona 1 efetiva", unit_of_measurement: bpm, icon: "mdi:heart-pulse", accuracy_decimals: 0, update_interval: never }
+  - { platform: template, id: s_slope, name: "CORE tendência", unit_of_measurement: "°C/min", icon: "mdi:chart-line-variant", accuracy_decimals: 3, update_interval: never }
+
+text_sensor:
+  - { platform: template, id: core_qualidade, name: "CORE qualidade", icon: "mdi:check-decagram", update_interval: never }
+  - { platform: template, id: core_estado_hr, name: "CORE estado HR", icon: "mdi:heart-cog", update_interval: never }
+  - platform: template
+    name: "Fonte HR ativa"
+    icon: mdi:bluetooth-connect
+    update_interval: 5s
+    lambda: |-
+      const uint32_t now = millis(), TO = 10000;
+      if (id(hr1_ts) && now - id(hr1_ts) < TO) return {"Fita 1"};
+      if (id(hr2_ts) && now - id(hr2_ts) < TO) return {"Fita 2"};
+      if (id(hrc_ts) && now - id(hrc_ts) < TO) return {"CORE"};
+      return {"Nenhuma"};
+
+# -----------------------------------------------------------------------------
+#  Botão físico
+# -----------------------------------------------------------------------------
+binary_sensor:
+  - platform: gpio
+    name: "Botão"
+    internal: true
+    pin:
+      number: GPIO21
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 30ms
+      - delayed_off: 30ms
+    on_multi_click:
+      - timing:                       # toque curto: modo / velocidade seguinte
+          - ON for at most 0.8s
+          - OFF for at least 0.05s
+        then:
+          - lambda: |-
+              auto i = id(modo).active_index();
+              const int m = i.has_value() ? (int) *i : 0;
+              const int s = id(ventoinha).state ? id(ventoinha).speed : 0;
+              switch (m) {
+                case 0: id(set_modo).execute(1); break;                          // -> Auto HR
+                case 1: id(set_modo).execute(2); break;                          // -> Temp. alvo
+                case 2: id(set_vel).execute(1); id(manual_keep) = true;
+                        id(set_modo).execute(3); break;                          // -> Manual 1
+                case 3: if (s >= 3) id(set_modo).execute(0);                     // Manual 3 -> Off
+                        else id(set_vel).execute(s + 1);                          // Manual +1
+                        break;
+                case 4: id(manual_keep) = true; id(set_modo).execute(3); break;   // Remoto -> Manual
+              }
+      - timing:                       # toque longo: Off imediato
+          - ON for at least 1.5s
+        then:
+          - script.execute:
+              id: set_modo
+              m: 0
+
+# -----------------------------------------------------------------------------
+#  Lógica principal (4 Hz)
+# -----------------------------------------------------------------------------
+interval:
+  - interval: 250ms
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          auto modo_atual = [&]() -> int {
+            auto i = id(modo).active_index(); return i.has_value() ? (int) *i : 0; };
+          auto vel_atual = [&]() -> int { return id(ventoinha).state ? id(ventoinha).speed : 0; };
+
+          // zona com histerese: sobe logo, só desce abaixo de (limiar - histerese)
+          auto zona = [](float v, float z1, float z2, float z3, float h, int cur) -> int {
+            if (std::isnan(v)) return 0;
+            const int raw = v > z3 ? 3 : v > z2 ? 2 : v > z1 ? 1 : 0;
+            if (raw >= cur) return raw;
+            const float th[4] = {0, z1, z2, z3};
+            int z = cur;
+            while (z > raw && v <= th[z] - h) z--;
+            return z;
+          };
+          auto frac = [](float v, float lo, float hi) -> float {
+            if (hi <= lo) return 0.5f;
+            const float f = (v - lo) / (hi - lo);
+            return f < 0 ? 0.0f : (f > 1 ? 1.0f : f);
+          };
+
+          // ---- 1) set externo à ventoínha -> muda de modo (sem prazos)
+          if (id(ext_fan_event)) {
+            id(ext_fan_event) = false;
+            const int m = modo_atual();
+            const bool on = id(ventoinha).state;
+            if (m <= 2 && on) id(set_modo).execute(3);                  // Off/Auto/Alvo -> Manual
+            else if ((m == 1 || m == 2) && !on) id(set_modo).execute(0); // desligada -> Off
+            else if (m == 3 && !on) id(set_modo).execute(0);
+            // m == 4 (Remoto): é a app a mandar, aceita
+          }
+
+          // ---- 2) entrada num modo novo
+          const int m = modo_atual();
+          if (m != id(last_mode)) {
+            id(last_mode) = m;
+            id(flash_until) = now + 1500;
+            id(hr_zone_g) = 0;
+            id(ct_zone_g) = 0;
+            id(ct_change_ms) = now - 3600000;   // permite mexer já
+            id(core_lost_ms) = 0;
+            id(data_ok) = true;
+            if (m == 0) id(set_vel).execute(0);
+            if (m == 3) {
+              if (!id(manual_keep) && vel_atual() == 0) id(set_vel).execute(1);
+              id(manual_keep) = false;
+            }
+          }
+
+          // ---- 3) dados
+          const float hr = id(hr_ativo).state;
+          const bool core_ok = id(ct_ts) && (now - id(ct_ts) < 30000);
+          const float ct = core_ok ? id(core_temp).state : NAN;
+
+          // tendência da temp. central (°C/min), amostrada a cada 60 s, suavizada
+          if (core_ok && !std::isnan(ct)) {
+            if (id(slope_ref_ms) == 0) { id(slope_ref) = ct; id(slope_ref_ms) = now; }
+            else if (now - id(slope_ref_ms) >= 60000) {
+              const float s = (ct - id(slope_ref)) / ((now - id(slope_ref_ms)) / 60000.0f);
+              id(ct_slope) = 0.5f * id(ct_slope) + 0.5f * s;
+              id(slope_ref) = ct; id(slope_ref_ms) = now;
+              id(s_slope).publish_state(id(ct_slope));
+            }
+          } else {
+            id(slope_ref_ms) = 0;
+          }
+
+          // desvio das zonas HR: ginásio e pele do CORE (média ponderada se houver os dois)
+          const float S = id(desvio_max).state;
+          float sa = NAN, ss = NAN, sh = 0;
+          const float g = id(temp_ginasio).state;
+          if (!std::isnan(g)) sa = S * (1.0f - 2.0f * frac(g, id(amb_frio).state, id(amb_quente).state));
+          const float sk = id(core_skin).state;
+          if (core_ok && !std::isnan(sk)) ss = S * (1.0f - 2.0f * frac(sk, id(pele_fria).state, id(pele_quente).state));
+          if (!std::isnan(sa) && !std::isnan(ss)) {
+            const float w = id(peso_pele).state / 100.0f;
+            sh = w * ss + (1.0f - w) * sa;
+          } else if (!std::isnan(sa)) sh = sa;
+          else if (!std::isnan(ss)) sh = ss;
+          if (std::isnan(id(s_desvio).state) || fabsf(id(s_desvio).state - sh) >= 0.5f) {
+            id(s_desvio).publish_state(sh);
+            id(s_z1_ef).publish_state(id(hr_z1).state + sh);
+          }
+
+          // ---- 4) modos automáticos
+          bool ok = true;
+          if (m == 1) {                                   // Auto HR
+            ok = !std::isnan(hr);
+            id(hr_zone_g) = zona(hr, id(hr_z1).state + sh, id(hr_z2).state + sh,
+                                 id(hr_z3).state + sh, id(hr_hyst).state, id(hr_zone_g));
+            id(set_vel).execute(ok ? id(hr_zone_g) : 0);
+          } else if (m == 2) {                            // Temp. alvo
+            if (core_ok && !std::isnan(ct)) {
+              id(core_lost_ms) = 0;
+              const float t = ct + id(antecipacao).state * id(ct_slope);
+              const float a = id(t_alvo).state, d = id(banda).state;
+              int z = zona(t, a, a + d, a + 2 * d, id(ct_hyst).state, id(ct_zone_g));
+              const bool dwell_ok = now - id(ct_change_ms) >= (uint32_t) (id(dwell_s).state * 1000.0f);
+              if (z < id(ct_zone_g) && !dwell_ok) z = id(ct_zone_g);   // só trava descidas
+              if (z != id(ct_zone_g)) { id(ct_zone_g) = z; id(ct_change_ms) = now; }
+              id(set_vel).execute(z);
+            } else {
+              ok = false;                                 // pisca; mantém a velocidade
+              if (id(core_lost_ms) == 0) id(core_lost_ms) = now | 1;
+              if (now - id(core_lost_ms) > ${core_timeout_min} * 60000UL) {
+                id(manual_keep) = true;                   // Manual à velocidade atual
+                id(set_modo).execute(3);
+              }
+            }
+          }
+          id(data_ok) = ok;

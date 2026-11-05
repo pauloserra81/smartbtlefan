@@ -26,3 +26,7 @@ Look for this defines in the code
 // Assign each GPIO to a relay
 //in my case GPIOS number 19, 23 and 33 are used, check numbers on your board.
 uint8_t relayGPIOs[NUM_RELAYS] = {19, 23, 33};
+
+## ESPHome version (v2)
+
+The `esphome/` folder has an ESPHome port with Home Assistant control and 5 modes (Off, Auto HR with heat-adaptive zones, core-temperature target with CORE, Manual, Remote). See [esphome/README.md](esphome/README.md).
