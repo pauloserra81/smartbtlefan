@@ -1,0 +1,90 @@
+# SuperFan — card do dashboard (só cards nativos do HA, sem HACS)
+# Colar em: Dashboard > Editar > Adicionar card > Manual
+# Os entity_id assumem friendly_name "SuperFan"; confirma em Definições > Entidades.
+type: vertical-stack
+cards:
+  - type: tile
+    entity: select.superfan_modo
+    name: Modo
+    icon: mdi:fan-auto
+    features:
+      - type: select-options
+  - type: tile
+    entity: fan.superfan_ventoinha
+    name: Ventoínha
+    features:
+      - type: fan-speed
+        style: icons
+  - type: glance
+    show_name: true
+    entities:
+      - entity: sensor.superfan_hr
+        name: HR
+      - entity: sensor.superfan_core_temperatura_central
+        name: Central
+      - entity: sensor.superfan_core_temperatura_pele
+        name: Pele
+      - entity: sensor.superfan_desvio_hr_atual
+        name: Desvio
+  # ---- Auto HR
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: select.superfan_modo
+        state: Auto HR
+    card:
+      type: entities
+      title: Auto HR
+      entities:
+        - entity: sensor.superfan_hr_zona_1_efetiva
+          name: Zona 1 agora (com desvio)
+        - entity: number.superfan_hr_zona_1
+          name: Zona 1 (base)
+        - entity: number.superfan_hr_zona_2
+          name: Zona 2 (base)
+        - entity: number.superfan_hr_zona_3
+          name: Zona 3 (base)
+        - type: section
+          label: Desvio por temperatura
+        - entity: number.superfan_desvio_hr_max
+          name: Desvio máximo
+        - entity: number.superfan_ginasio_frio
+          name: Frio
+        - entity: number.superfan_ginasio_quente
+          name: Quente
+  # ---- Temp. alvo
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: select.superfan_modo
+        state: Temp. alvo
+    card:
+      type: entities
+      title: Temperatura alvo
+      entities:
+        - entity: number.superfan_temp_central_alvo
+          name: Alvo
+        - entity: sensor.superfan_core_tendencia
+          name: Tendência
+        - entity: sensor.superfan_core_qualidade
+          name: Qualidade CORE
+        - entity: sensor.superfan_core_heat_strain_index
+          name: Heat strain index
+  # ---- Remoto
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: select.superfan_modo
+        state: Remoto
+    card:
+      type: markdown
+      content: >-
+        **Remoto** — a app do treino está a controlar a velocidade.
+        Carrega no botão da ventoínha (ou escolhe outro modo) para retomar o controlo.
+  - type: history-graph
+    hours_to_show: 2
+    entities:
+      - entity: sensor.superfan_hr
+        name: HR
+      - entity: sensor.superfan_core_temperatura_central
+        name: Temp. central
